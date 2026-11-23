@@ -11,6 +11,7 @@ Contents
    Quickstart <quickstart>
    The LightFM model class <lightfm>
    Model evaluation <lightfm.evaluation>
+   Candidate-restricted training and evaluation <candidate_items>
    Cross validation <cross_validation>
    Constructing datasets <lightfm.data>
    Built-in datasets <datasets>

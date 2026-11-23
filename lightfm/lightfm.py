@@ -6,14 +6,26 @@ import numpy as np
 import scipy.sparse as sp
 
 from ._lightfm_fast import (
+    CSRIndexMatrix,
     CSRMatrix,
     FastLightFM,
     fit_bpr,
+    fit_bpr_candidates,
     fit_logistic,
     fit_warp,
+    fit_warp_candidates,
     fit_warp_kos,
     predict_lightfm,
     predict_ranks,
+    predict_ranks_candidates,
+)
+from ._candidates import (
+    check_positives_are_candidates,
+    check_test_positives_are_candidates,
+    negative_candidates,
+    normalize_candidate_items,
+    positive_mask,
+    to_index_csr,
 )
 
 __all__ = ["LightFM"]
@@ -500,6 +512,7 @@ class LightFM(object):
         epochs=1,
         num_threads=1,
         verbose=False,
+        candidate_items=None,
     ):
         """
         Fit the model.
@@ -535,6 +548,12 @@ class LightFM(object):
         verbose: bool, optional
              whether to print progress messages.
              If `tqdm` is installed, a progress bar will be displayed instead.
+        candidate_items: scipy sparse boolean matrix of shape [n_users, n_items], optional
+             Per-user candidate eligibility. A stored ``True`` marks an item
+             the user is eligible to see; explicitly stored ``False`` and
+             missing coordinates are ineligible. Only the ``bpr`` and
+             ``warp`` losses support candidate-restricted training; every
+             training positive must be a candidate for its user.
 
         Returns
         -------
@@ -543,6 +562,20 @@ class LightFM(object):
             the fitted model
 
         """
+
+        # Validate candidate arguments before discarding any learned state:
+        # an unsupported loss, a malformed table or an ineligible training
+        # positive should leave the model untouched.
+        validated_candidates = normalize_candidate_items(
+            candidate_items, interactions.shape
+        )
+        if validated_candidates is not None:
+            if self.loss not in ("bpr", "warp"):
+                raise ValueError(
+                    "candidate_items is only supported for the 'bpr' and "
+                    "'warp' losses, got '{}'.".format(self.loss)
+                )
+            check_positives_are_candidates(interactions, validated_candidates)
 
         # Discard old results, if any
         self._reset_state()
@@ -555,6 +588,7 @@ class LightFM(object):
             epochs=epochs,
             num_threads=num_threads,
             verbose=verbose,
+            candidate_items=validated_candidates,
         )
 
     def fit_partial(
@@ -566,6 +600,7 @@ class LightFM(object):
         epochs=1,
         num_threads=1,
         verbose=False,
+        candidate_items=None,
     ):
         """
         Fit the model.
@@ -604,6 +639,16 @@ class LightFM(object):
         verbose: bool, optional
              whether to print progress messages.
              If `tqdm` is installed, a progress bar will be displayed instead.
+        candidate_items: scipy sparse boolean matrix of shape [n_users, n_items], optional
+             Per-user candidate eligibility for this call. A stored ``True``
+             marks an item the user is eligible to see; explicitly stored
+             ``False`` and missing coordinates are ineligible. Only the
+             ``bpr`` and ``warp`` losses support candidate-restricted
+             training. Every positive training interaction must be a
+             candidate for its user, otherwise a ``ValueError`` is raised
+             before any parameter is updated. Supplying a different matrix on
+             a later call takes effect immediately while retaining the
+             previously learned parameters.
 
         Returns
         -------
@@ -622,6 +667,22 @@ class LightFM(object):
         sample_weight_data = self._process_sample_weight(interactions, sample_weight)
 
         n_users, n_items = interactions.shape
+
+        candidate_items = normalize_candidate_items(
+            candidate_items, (n_users, n_items)
+        )
+
+        if candidate_items is not None:
+            if self.loss not in ("bpr", "warp"):
+                raise ValueError(
+                    "candidate_items is only supported for the 'bpr' and "
+                    "'warp' losses, got '{}'.".format(self.loss)
+                )
+
+            # Validate before touching the model state: a training positive
+            # outside the eligible set is a hard error, not a silent skip.
+            check_positives_are_candidates(interactions, candidate_items)
+
         (user_features, item_features) = self._construct_feature_matrices(
             n_users, n_items, user_features, item_features
         )
@@ -651,6 +712,25 @@ class LightFM(object):
         if num_threads < 1:
             raise ValueError("Number of threads must be 1 or larger.")
 
+        # Precompute the per-user negative sampling universe once per call.
+        # This is sparse (O(number of eligible entries)) and, crucially,
+        # never materialises a dense user x item matrix.
+        if candidate_items is not None and self.loss in ("bpr", "warp"):
+            positives = positive_mask(interactions)
+            negative_items = negative_candidates(candidate_items, positives)
+            # WARP's rank estimate uses the number of items the positive
+            # competes against. In the unrestricted model that is the number
+            # of non-positive items (the sampling universe); here it is the
+            # number of eligible non-positive items. This keeps the rank
+            # estimate on the same scale as the uniform negative sampling
+            # distribution.
+            rank_universe = np.asarray(
+                negative_items.getnnz(axis=1), dtype=np.int32
+            )
+        else:
+            negative_items = None
+            rank_universe = None
+
         for _ in self._progress(epochs, verbose=verbose):
             self._run_epoch(
                 item_features,
@@ -659,6 +739,8 @@ class LightFM(object):
                 sample_weight_data,
                 num_threads,
                 self.loss,
+                negative_items=negative_items,
+                rank_universe=rank_universe,
             )
 
             self._check_finite()
@@ -673,6 +755,8 @@ class LightFM(object):
         sample_weight,
         num_threads,
         loss,
+        negative_items=None,
+        rank_universe=None,
     ):
         """
         Run an individual epoch.
@@ -690,6 +774,49 @@ class LightFM(object):
         self.random_state.shuffle(shuffle_indices)
 
         lightfm_data = self._get_lightfm_data()
+
+        if negative_items is not None:
+            # Candidate-restricted training.  ``negative_items`` contains
+            # only eligible non-positive items, sorted and duplicate-free.
+            negative_items = to_index_csr(negative_items)
+
+            if loss == "warp":
+                fit_warp_candidates(
+                    CSRMatrix(item_features),
+                    CSRMatrix(user_features),
+                    CSRIndexMatrix(negative_items),
+                    rank_universe,
+                    interactions.row,
+                    interactions.col,
+                    interactions.data,
+                    sample_weight,
+                    shuffle_indices,
+                    lightfm_data,
+                    self.learning_rate,
+                    self.item_alpha,
+                    self.user_alpha,
+                    num_threads,
+                    self.random_state,
+                )
+                return
+            elif loss == "bpr":
+                fit_bpr_candidates(
+                    CSRMatrix(item_features),
+                    CSRMatrix(user_features),
+                    CSRIndexMatrix(negative_items),
+                    interactions.row,
+                    interactions.col,
+                    interactions.data,
+                    sample_weight,
+                    shuffle_indices,
+                    lightfm_data,
+                    self.learning_rate,
+                    self.item_alpha,
+                    self.user_alpha,
+                    num_threads,
+                    self.random_state,
+                )
+                return
 
         # Call the estimation routines.
         if loss == "warp":
@@ -889,6 +1016,7 @@ class LightFM(object):
         user_features=None,
         num_threads=1,
         check_intersections=True,
+        candidate_items=None,
     ):
         """
         Predict the rank of selected interactions. Computes recommendation
@@ -925,6 +1053,12 @@ class LightFM(object):
             Only relevant when train_interactions are supplied.
             A flag that signals whether the test and train matrices should be checked
             for intersections to prevent optimistic ranks / wrong evaluation / bad data split.
+        candidate_items: scipy sparse boolean matrix of shape [n_users, n_items], optional
+            Per-user candidate eligibility. When supplied, only eligible
+            items take part in the ranking (training interactions are still
+            excluded). Every test positive must be a candidate, otherwise a
+            ``ValueError`` is raised. Explicitly stored ``False`` entries are
+            ineligible; duplicate coordinates count once.
 
         Returns
         -------
@@ -945,6 +1079,13 @@ class LightFM(object):
             self._check_test_train_intersections(test_interactions, train_interactions)
 
         n_users, n_items = test_interactions.shape
+
+        candidate_items = normalize_candidate_items(
+            candidate_items, (n_users, n_items)
+        )
+
+        if candidate_items is not None:
+            check_test_positives_are_candidates(test_interactions, candidate_items)
 
         (user_features, item_features) = self._construct_feature_matrices(
             n_users, n_items, user_features, item_features
@@ -976,15 +1117,29 @@ class LightFM(object):
 
         lightfm_data = self._get_lightfm_data()
 
-        predict_ranks(
-            CSRMatrix(item_features),
-            CSRMatrix(user_features),
-            CSRMatrix(test_interactions),
-            CSRMatrix(train_interactions),
-            ranks.data,
-            lightfm_data,
-            num_threads,
-        )
+        if candidate_items is not None:
+            candidate_items = to_index_csr(candidate_items)
+
+            predict_ranks_candidates(
+                CSRMatrix(item_features),
+                CSRMatrix(user_features),
+                CSRMatrix(test_interactions),
+                CSRMatrix(train_interactions),
+                CSRIndexMatrix(candidate_items),
+                ranks.data,
+                lightfm_data,
+                num_threads,
+            )
+        else:
+            predict_ranks(
+                CSRMatrix(item_features),
+                CSRMatrix(user_features),
+                CSRMatrix(test_interactions),
+                CSRMatrix(train_interactions),
+                ranks.data,
+                lightfm_data,
+                num_threads,
+            )
 
         return ranks
 

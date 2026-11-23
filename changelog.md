@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Added an optional `candidate_items` sparse boolean matrix to `LightFM.fit`,
+  `LightFM.fit_partial`, `LightFM.predict_rank`, `precision_at_k`,
+  `recall_at_k`, `auc_score` and `reciprocal_rank`. It restricts training
+  negatives (BPR and WARP only), ranking and evaluation to the items each user
+  is eligible to see. Training positives outside the candidate set are
+  rejected before any parameter changes; WARP's rank estimate and the
+  evaluation denominators use the candidate universe.
+
 ## [1.17][2023-03-19]
 
 ### Fixed

@@ -18,6 +18,10 @@ ctypedef float flt
 
 cdef flt MAX_REG_SCALE = 1000000.0
 
+# Undefined AUC value used when a user's ranking universe contains no
+# negative candidate items (and therefore has no AUC).
+cdef flt NAN_VALUE = float("nan")
+
 
 cdef extern from "math.h" nogil:
     double sqrt(double)
@@ -182,6 +186,48 @@ cdef class CSRMatrix:
         return self.indptr[row + 1]
 
 
+cdef class CSRIndexMatrix:
+    """
+    Utility class for accessing the sparsity pattern of a CSR matrix.
+
+    Used for candidate / negative-item matrices, where only the item ids
+    stored in each row matter. Keeping a separate class means eligibility
+    matrices never have to be converted to floating point: their memory
+    footprint stays at one index per eligible entry (plus the row pointers).
+    """
+
+    cdef int[::1] indices
+    cdef int[::1] indptr
+
+    cdef int rows
+    cdef int cols
+    cdef int nnz
+
+    def __init__(self, csr_matrix):
+
+        self.indices = csr_matrix.indices
+        self.indptr = csr_matrix.indptr
+
+        self.rows, self.cols = csr_matrix.shape
+        self.nnz = len(self.indices)
+
+    cdef int get_row_start(self, int row) nogil:
+        """
+        Return the pointer to the start of the
+        indices for row.
+        """
+
+        return self.indptr[row]
+
+    cdef int get_row_end(self, int row) nogil:
+        """
+        Return the pointer to the end of the
+        indices for row.
+        """
+
+        return self.indptr[row + 1]
+
+
 cdef class FastLightFM:
     """
     Class holding all the model state.
@@ -282,6 +328,31 @@ cdef inline int in_positives(int item_id, int user_id, CSRMatrix interactions) n
         return 0
     else:
         return 1
+
+
+cdef inline int has_candidates(int user_id, CSRIndexMatrix candidates) nogil:
+
+    return candidates.get_row_end(user_id) > candidates.get_row_start(user_id)
+
+
+cdef inline int sample_candidate(int user_id,
+                                 CSRIndexMatrix candidates,
+                                 unsigned int *seed) nogil:
+    """
+    Draw an item uniformly at random from the candidate row of user_id.
+
+    The caller must have checked that the row is non-empty; because the
+    matrix already excludes positives, every draw is a usable negative and
+    no draw is wasted on an ineligible or positive item.
+    """
+
+    cdef int start_idx, stop_idx, no_candidates
+
+    start_idx = candidates.get_row_start(user_id)
+    stop_idx = candidates.get_row_end(user_id)
+    no_candidates = stop_idx - start_idx
+
+    return candidates.indices[start_idx + (rand_r(seed) % no_candidates)]
 
 
 cdef inline void compute_representation(CSRMatrix features,
@@ -1182,6 +1253,275 @@ def fit_bpr(CSRMatrix item_features,
                user_alpha)
 
 
+def fit_warp_candidates(CSRMatrix item_features,
+                        CSRMatrix user_features,
+                        CSRIndexMatrix negative_candidates,
+                        int[::1] rank_universe,
+                        int[::1] user_ids,
+                        int[::1] item_ids,
+                        flt[::1] Y,
+                        flt[::1] sample_weight,
+                        int[::1] shuffle_indices,
+                        FastLightFM lightfm,
+                        double learning_rate,
+                        double item_alpha,
+                        double user_alpha,
+                        int num_threads,
+                        random_state):
+    """
+    Fit the model using the WARP loss over per-user candidate items.
+
+    ``negative_candidates`` holds, for every user, the candidate items that
+    are not marked positive by this training interaction matrix. Every draw
+    from that row is uniform over eligible non-positive items, so no
+    ``max_sampled`` attempt is wasted on a positive or ineligible item.
+
+    ``rank_universe[user_id]`` is the number of items in that user's
+    ranking universe, excluding the positive being optimised. It replaces
+    the global catalogue size in the WARP rank estimate. A user whose
+    candidate list has been used up (no negative candidates) is skipped
+    without an update.
+    """
+
+    cdef int i, no_examples, user_id, positive_item_id, gamma
+    cdef int negative_item_id, sampled, row
+    cdef double positive_prediction, negative_prediction
+    cdef double loss, MAX_LOSS
+    cdef flt weight
+    cdef flt *user_repr
+    cdef flt *pos_it_repr
+    cdef flt *neg_it_repr
+    cdef unsigned int[::1] random_states
+
+    random_states = random_state.randint(0,
+                                         np.iinfo(np.int32).max,
+                                         size=num_threads).astype(np.uint32)
+
+    no_examples = Y.shape[0]
+    MAX_LOSS = 10.0
+
+    {nogil_block}
+
+        user_repr = <flt *>malloc(sizeof(flt) * (lightfm.no_components + 1))
+        pos_it_repr = <flt *>malloc(sizeof(flt) * (lightfm.no_components + 1))
+        neg_it_repr = <flt *>malloc(sizeof(flt) * (lightfm.no_components + 1))
+
+        for i in {range_block}(no_examples):
+            row = shuffle_indices[i]
+
+            user_id = user_ids[row]
+            positive_item_id = item_ids[row]
+
+            if not Y[row] > 0:
+                continue
+
+            # No eligible negatives left for this user: skip the comparison
+            # rather than sampling forever or fabricating an update.
+            if not has_candidates(user_id, negative_candidates):
+                continue
+
+            if rank_universe[user_id] < 1:
+                continue
+
+            weight = sample_weight[row]
+
+            compute_representation(user_features,
+                                   lightfm.user_features,
+                                   lightfm.user_biases,
+                                   lightfm,
+                                   user_id,
+                                   lightfm.user_scale,
+                                   user_repr)
+            compute_representation(item_features,
+                                   lightfm.item_features,
+                                   lightfm.item_biases,
+                                   lightfm,
+                                   positive_item_id,
+                                   lightfm.item_scale,
+                                   pos_it_repr)
+
+            positive_prediction = compute_prediction_from_repr(user_repr,
+                                                               pos_it_repr,
+                                                               lightfm.no_components)
+
+            sampled = 0
+
+            while sampled < lightfm.max_sampled:
+
+                sampled = sampled + 1
+                negative_item_id = sample_candidate(user_id,
+                                                    negative_candidates,
+                                                    &random_states[{thread_num}])
+
+                compute_representation(item_features,
+                                       lightfm.item_features,
+                                       lightfm.item_biases,
+                                       lightfm,
+                                       negative_item_id,
+                                       lightfm.item_scale,
+                                       neg_it_repr)
+
+                negative_prediction = compute_prediction_from_repr(user_repr,
+                                                                   neg_it_repr,
+                                                                   lightfm.no_components)
+
+                if negative_prediction > positive_prediction - 1:
+
+                    # The WARP rank estimate uses the number of items this
+                    # user can actually be ranked against.
+                    loss = weight * log(max(1.0,
+                                            floor(rank_universe[user_id]
+                                                  / sampled)))
+
+                    # Clip gradients for numerical stability.
+                    if loss > MAX_LOSS:
+                        loss = MAX_LOSS
+
+                    warp_update(loss,
+                                item_features,
+                                user_features,
+                                user_id,
+                                positive_item_id,
+                                negative_item_id,
+                                user_repr,
+                                pos_it_repr,
+                                neg_it_repr,
+                                lightfm,
+                                item_alpha,
+                                user_alpha)
+                    break
+
+            if lightfm.item_scale > MAX_REG_SCALE or lightfm.user_scale > MAX_REG_SCALE:
+                locked_regularize(lightfm,
+                                  item_alpha,
+                                  user_alpha)
+
+        free(user_repr)
+        free(pos_it_repr)
+        free(neg_it_repr)
+
+    regularize(lightfm,
+               item_alpha,
+               user_alpha)
+
+
+def fit_bpr_candidates(CSRMatrix item_features,
+                       CSRMatrix user_features,
+                       CSRIndexMatrix negative_candidates,
+                       int[::1] user_ids,
+                       int[::1] item_ids,
+                       flt[::1] Y,
+                       flt[::1] sample_weight,
+                       int[::1] shuffle_indices,
+                       FastLightFM lightfm,
+                       double learning_rate,
+                       double item_alpha,
+                       double user_alpha,
+                       int num_threads,
+                       random_state):
+    """
+    Fit the model using the BPR loss over per-user candidate items.
+
+    A single negative is drawn uniformly from the candidate items that this
+    user has not marked positive. A user with no such items is skipped.
+    """
+
+    cdef int i, no_examples, user_id, positive_item_id
+    cdef int negative_item_id, row
+    cdef double positive_prediction, negative_prediction
+    cdef flt weight
+    cdef unsigned int[::1] random_states
+    cdef flt *user_repr
+    cdef flt *pos_it_repr
+    cdef flt *neg_it_repr
+
+    random_states = random_state.randint(0,
+                                         np.iinfo(np.int32).max,
+                                         size=num_threads).astype(np.uint32)
+
+    no_examples = Y.shape[0]
+
+    {nogil_block}
+
+        user_repr = <flt *>malloc(sizeof(flt) * (lightfm.no_components + 1))
+        pos_it_repr = <flt *>malloc(sizeof(flt) * (lightfm.no_components + 1))
+        neg_it_repr = <flt *>malloc(sizeof(flt) * (lightfm.no_components + 1))
+
+        for i in {range_block}(no_examples):
+            row = shuffle_indices[i]
+
+            if not Y[row] > 0:
+                continue
+
+            user_id = user_ids[row]
+            positive_item_id = item_ids[row]
+
+            # No eligible negatives left for this user: skip.
+            if not has_candidates(user_id, negative_candidates):
+                continue
+
+            negative_item_id = sample_candidate(user_id,
+                                                negative_candidates,
+                                                &random_states[{thread_num}])
+
+            weight = sample_weight[row]
+
+            compute_representation(user_features,
+                                   lightfm.user_features,
+                                   lightfm.user_biases,
+                                   lightfm,
+                                   user_id,
+                                   lightfm.user_scale,
+                                   user_repr)
+            compute_representation(item_features,
+                                   lightfm.item_features,
+                                   lightfm.item_biases,
+                                   lightfm,
+                                   positive_item_id,
+                                   lightfm.item_scale,
+                                   pos_it_repr)
+            compute_representation(item_features,
+                                   lightfm.item_features,
+                                   lightfm.item_biases,
+                                   lightfm,
+                                   negative_item_id,
+                                   lightfm.item_scale,
+                                   neg_it_repr)
+
+            positive_prediction = compute_prediction_from_repr(user_repr,
+                                                               pos_it_repr,
+                                                               lightfm.no_components)
+            negative_prediction = compute_prediction_from_repr(user_repr,
+                                                               neg_it_repr,
+                                                               lightfm.no_components)
+
+            warp_update(weight * (1.0 - sigmoid(positive_prediction - negative_prediction)),
+                        item_features,
+                        user_features,
+                        user_id,
+                        positive_item_id,
+                        negative_item_id,
+                        user_repr,
+                        pos_it_repr,
+                        neg_it_repr,
+                        lightfm,
+                        item_alpha,
+                        user_alpha)
+
+            if lightfm.item_scale > MAX_REG_SCALE or lightfm.user_scale > MAX_REG_SCALE:
+                locked_regularize(lightfm,
+                                  item_alpha,
+                                  user_alpha)
+
+        free(user_repr)
+        free(pos_it_repr)
+        free(neg_it_repr)
+
+    regularize(lightfm,
+               item_alpha,
+               user_alpha)
+
+
 def predict_lightfm(CSRMatrix item_features,
                     CSRMatrix user_features,
                     int[::1] user_ids,
@@ -1237,13 +1577,15 @@ def predict_ranks(CSRMatrix item_features,
                   FastLightFM lightfm,
                   int num_threads):
     """
+    Compute ranks over the full item catalogue.
     """
 
     cdef int i, j, user_id, item_id, predictions_size, row_start, row_stop
     cdef flt *user_repr
     cdef flt *it_repr
     cdef flt *predictions
-    cdef flt prediction, rank
+    cdef int *item_ids
+    cdef flt prediction
 
     predictions_size = 0
 
@@ -1321,6 +1663,118 @@ def predict_ranks(CSRMatrix item_features,
         free(user_repr)
         free(it_repr)
         free(predictions)
+        free(item_ids)
+
+
+def predict_ranks_candidates(CSRMatrix item_features,
+                             CSRMatrix user_features,
+                             CSRMatrix test_interactions,
+                             CSRMatrix train_interactions,
+                             CSRIndexMatrix candidates,
+                             flt[::1] ranks,
+                             FastLightFM lightfm,
+                             int num_threads):
+    """
+    Compute ranks using only each user's eligible candidate items.
+
+    The candidate rows are iterated directly, so the cost is proportional to
+    the number of eligible items rather than to the full catalogue. Items in
+    ``train_interactions`` are still excluded from the ranking, and items that
+    are not candidates never contribute to a rank.
+
+    Ties are broken pessimistically: an eligible item with a prediction
+    greater than or equal to the target's prediction increments the target's
+    rank.
+    """
+
+    cdef int i, j, user_id, item_id, predictions_size, row_start, row_stop
+    cdef int cand_start, cand_stop, candidate_item_id
+    cdef flt *user_repr
+    cdef flt *it_repr
+    cdef flt *predictions
+    cdef int *item_ids
+    cdef flt prediction
+
+    predictions_size = 0
+
+    # Figure out the max size of the test-row buffer.
+    for user_id in range(test_interactions.rows):
+        predictions_size = int_max(predictions_size,
+                                   test_interactions.get_row_end(user_id)
+                                   - test_interactions.get_row_start(user_id))
+
+    {nogil_block}
+
+        user_repr = <flt *>malloc(sizeof(flt) * (lightfm.no_components + 1))
+        it_repr = <flt *>malloc(sizeof(flt) * (lightfm.no_components + 1))
+        item_ids = <int *>malloc(sizeof(int) * int_max(predictions_size, 1))
+        predictions = <flt *>malloc(sizeof(flt) * int_max(predictions_size, 1))
+
+        for user_id in {range_block}(test_interactions.rows):
+
+            row_start = test_interactions.get_row_start(user_id)
+            row_stop = test_interactions.get_row_end(user_id)
+
+            if row_stop == row_start:
+                # No test interactions for this user
+                continue
+
+            compute_representation(user_features,
+                                   lightfm.user_features,
+                                   lightfm.user_biases,
+                                   lightfm,
+                                   user_id,
+                                   lightfm.user_scale,
+                                   user_repr)
+
+            # Compute predictions for the items whose ranks we want to know.
+            for i in range(row_stop - row_start):
+
+                item_id = test_interactions.indices[row_start + i]
+
+                compute_representation(item_features,
+                                       lightfm.item_features,
+                                       lightfm.item_biases,
+                                       lightfm,
+                                       item_id,
+                                       lightfm.item_scale,
+                                       it_repr)
+
+                item_ids[i] = item_id
+                predictions[i] = compute_prediction_from_repr(user_repr,
+                                                              it_repr,
+                                                              lightfm.no_components)
+
+            # Walk only the eligible candidate items for this user.
+            cand_start = candidates.get_row_start(user_id)
+            cand_stop = candidates.get_row_end(user_id)
+
+            for j in range(cand_start, cand_stop):
+
+                candidate_item_id = candidates.indices[j]
+
+                if in_positives(candidate_item_id, user_id, train_interactions):
+                    continue
+
+                compute_representation(item_features,
+                                       lightfm.item_features,
+                                       lightfm.item_biases,
+                                       lightfm,
+                                       candidate_item_id,
+                                       lightfm.item_scale,
+                                       it_repr)
+                prediction = compute_prediction_from_repr(user_repr,
+                                                          it_repr,
+                                                          lightfm.no_components)
+
+                for i in range(row_stop - row_start):
+                    if candidate_item_id != item_ids[i] and prediction >= predictions[i]:
+                        ranks[row_start + i] += 1.0
+
+        free(user_repr)
+        free(it_repr)
+        free(predictions)
+        free(item_ids)
 
 
 def calculate_auc_from_rank(CSRMatrix ranks,
@@ -1376,7 +1830,91 @@ def calculate_auc_from_rank(CSRMatrix ranks,
                 auc[user_id] /= num_positives
 
 
+def calculate_auc_from_rank_candidates(CSRMatrix ranks,
+                                       int[::1] num_candidates,
+                                       flt[::1] rank_data,
+                                       flt[::1] auc,
+                                       int num_threads):
+    """
+    Compute per-user AUC from ranks computed over candidate items only.
+
+    ``num_candidates[user_id]`` is the size of the user's ranking universe
+    after removing training interactions (``C_eff``). The number of negatives
+    is therefore ``C_eff - num_positives``. Users with test positives but no
+    negative candidate items get NaN: AUC is undefined without a negative.
+    Users with no test positives keep the original 0.5 convention.
+    """
+
+    cdef int i, j, user_id, row_start, row_stop, num_negatives, num_positives
+    cdef flt rank
+
+    {nogil_block}
+        for user_id in {range_block}(ranks.rows):
+
+            row_start = ranks.get_row_start(user_id)
+            row_stop = ranks.get_row_end(user_id)
+
+            num_positives = row_stop - row_start
+
+            # Preserve the historical behaviour for rows without positives.
+            if num_positives == 0:
+                auc[user_id] = 0.5
+                continue
+
+            num_negatives = num_candidates[user_id] - num_positives
+
+            # No eligible negative items left: AUC is undefined.
+            if num_negatives <= 0:
+                auc[user_id] = NAN_VALUE
+                continue
+
+            # Sort the positives according to
+            # increasing rank.
+            qsort(&rank_data[row_start],
+                  num_positives,
+                  sizeof(flt),
+                  flt_compare)
+
+            for i in range(num_positives):
+
+                rank = ranks.data[row_start + i]
+
+                # There are i other positives that
+                # are higher-ranked, reduce the rank
+                # by i. Ignore ties but ensure that
+                # the resulting rank is nonnegative.
+                rank = rank - i
+
+                if rank < 0:
+                    rank = 0
+
+                # Number of negatives that rank above the current item
+                # over the total number of negatives: the probability
+                # of rank inversion.
+                auc[user_id] += 1.0 - rank / num_negatives
+
+            auc[user_id] /= num_positives
+
+
 # Expose test functions
+def __test_sample_candidates(CSRIndexMatrix candidates,
+                             int user_id,
+                             int n,
+                             unsigned int seed):
+    """
+    Draw n items from a user's candidate row, for testing the sampler.
+    """
+
+    cdef int i
+    cdef int[::1] samples = np.empty(n, dtype=np.int32)
+    cdef unsigned int local_seed = seed
+
+    for i in range(n):
+        samples[i] = sample_candidate(user_id, candidates, &local_seed)
+
+    return np.asarray(samples)
+
+
 def __test_in_positives(int row, int col, CSRMatrix mat):
 
     if in_positives(col, row, mat):

@@ -6,9 +6,25 @@ a fitted LightFM model.
 
 import numpy as np
 
-from ._lightfm_fast import CSRMatrix, calculate_auc_from_rank
+from ._lightfm_fast import (
+    CSRMatrix,
+    calculate_auc_from_rank,
+    calculate_auc_from_rank_candidates,
+)
+from ._candidates import (
+    eligible_counts,
+    normalize_candidate_items,
+)
 
 __all__ = ["precision_at_k", "recall_at_k", "auc_score", "reciprocal_rank"]
+
+
+def _check_k(k):
+    if isinstance(k, bool) or not isinstance(k, (int, np.integer)):
+        raise ValueError("k must be a positive integer, got {!r}.".format(k))
+    if k < 1:
+        raise ValueError("k must be a positive integer, got {!r}.".format(k))
+    return int(k)
 
 
 def precision_at_k(
@@ -21,6 +37,7 @@ def precision_at_k(
     preserve_rows=False,
     num_threads=1,
     check_intersections=True,
+    candidate_items=None,
 ):
     """
     Measure the precision at k metric for a model: the fraction of known
@@ -39,7 +56,7 @@ def precision_at_k(
          will be omitted from the score calculations to avoid re-recommending
          known positives.
     k: integer, optional
-         The k parameter.
+         The k parameter. Must be a positive integer.
     user_features: np.float32 csr_matrix of shape [n_users, n_user_features], optional
          Each row contains that user's weights over features.
     item_features: np.float32 csr_matrix of shape [n_items, n_item_features], optional
@@ -56,6 +73,11 @@ def precision_at_k(
         Only relevant when train_interactions are supplied.
         A flag that signals whether the test and train matrices should be checked
         for intersections to prevent optimistic ranks / wrong evaluation / bad data split.
+    candidate_items: scipy sparse boolean matrix of shape [n_users, n_items], optional
+         Per-user candidate eligibility. When supplied, ranking is restricted
+         to eligible items and the precision denominator becomes
+         ``min(k, number of eligible items after excluding training
+         interactions)`` for each user.
 
     Returns
     -------
@@ -68,6 +90,8 @@ def precision_at_k(
     if num_threads < 1:
         raise ValueError("Number of threads must be 1 or larger.")
 
+    k = _check_k(k)
+
     ranks = model.predict_rank(
         test_interactions,
         train_interactions=train_interactions,
@@ -75,11 +99,30 @@ def precision_at_k(
         item_features=item_features,
         num_threads=num_threads,
         check_intersections=check_intersections,
+        candidate_items=candidate_items,
     )
+
+    if candidate_items is not None:
+        candidate_items = normalize_candidate_items(
+            candidate_items, test_interactions.shape
+        )
+        effective_candidates = eligible_counts(candidate_items, train_interactions)
+        denominators = np.minimum(k, effective_candidates).astype(np.float64)
+        # A user with no eligible items gets a zero denominator; such a user
+        # has no rank data, so define the ratio as zero.
+        safe_denominators = np.where(denominators > 0, denominators, 1.0)
+    else:
+        safe_denominators = None
 
     ranks.data = np.less(ranks.data, k, ranks.data)
 
-    precision = np.squeeze(np.array(ranks.sum(axis=1))) / k
+    hits = np.asarray(ranks.sum(axis=1)).ravel()
+
+    if candidate_items is not None:
+        precision = np.true_divide(hits, safe_denominators)
+        precision[denominators <= 0] = 0.0
+    else:
+        precision = hits / k
 
     if not preserve_rows:
         precision = precision[test_interactions.getnnz(axis=1) > 0]
@@ -97,6 +140,7 @@ def recall_at_k(
     preserve_rows=False,
     num_threads=1,
     check_intersections=True,
+    candidate_items=None,
 ):
     """
     Measure the recall at k metric for a model: the number of positive items in
@@ -115,7 +159,7 @@ def recall_at_k(
          will be omitted from the score calculations to avoid re-recommending
          known positives.
     k: integer, optional
-         The k parameter.
+         The k parameter. Must be a positive integer.
     user_features: np.float32 csr_matrix of shape [n_users, n_user_features], optional
          Each row contains that user's weights over features.
     item_features: np.float32 csr_matrix of shape [n_items, n_item_features], optional
@@ -132,6 +176,10 @@ def recall_at_k(
         Only relevant when train_interactions are supplied.
         A flag that signals whether the test and train matrices should be checked
         for intersections to prevent optimistic ranks / wrong evaluation / bad data split.
+    candidate_items: scipy sparse boolean matrix of shape [n_users, n_items], optional
+         Per-user candidate eligibility. When supplied, ranking is restricted
+         to eligible items. The denominator stays the number of test positives
+         for the user.
 
     Returns
     -------
@@ -145,6 +193,8 @@ def recall_at_k(
     if num_threads < 1:
         raise ValueError("Number of threads must be 1 or larger.")
 
+    k = _check_k(k)
+
     ranks = model.predict_rank(
         test_interactions,
         train_interactions=train_interactions,
@@ -152,18 +202,19 @@ def recall_at_k(
         item_features=item_features,
         num_threads=num_threads,
         check_intersections=check_intersections,
+        candidate_items=candidate_items,
     )
 
     ranks.data = np.less(ranks.data, k, ranks.data)
 
-    retrieved = np.squeeze(test_interactions.getnnz(axis=1))
-    hit = np.squeeze(np.array(ranks.sum(axis=1)))
+    retrieved = np.asarray(test_interactions.getnnz(axis=1)).ravel()
+    hit = np.asarray(ranks.sum(axis=1)).ravel()
 
     if not preserve_rows:
         hit = hit[test_interactions.getnnz(axis=1) > 0]
         retrieved = retrieved[test_interactions.getnnz(axis=1) > 0]
 
-    return hit / retrieved
+    return np.true_divide(hit, retrieved)
 
 
 def auc_score(
@@ -175,6 +226,7 @@ def auc_score(
     preserve_rows=False,
     num_threads=1,
     check_intersections=True,
+    candidate_items=None,
 ):
     """
     Measure the ROC AUC metric for a model: the probability that a randomly
@@ -209,6 +261,11 @@ def auc_score(
         Only relevant when train_interactions are supplied.
         A flag that signals whether the test and train matrices should be checked
         for intersections to prevent optimistic ranks / wrong evaluation / bad data split.
+    candidate_items: scipy sparse boolean matrix of shape [n_users, n_items], optional
+         Per-user candidate eligibility. When supplied, positive/negative
+         comparisons only involve eligible items (excluding training
+         interactions). Users with test positives but no remaining negative
+         candidate items receive ``NaN``.
 
     Returns
     -------
@@ -228,6 +285,7 @@ def auc_score(
         item_features=item_features,
         num_threads=num_threads,
         check_intersections=check_intersections,
+        candidate_items=candidate_items,
     )
 
     assert np.all(ranks.data >= 0)
@@ -241,12 +299,30 @@ def auc_score(
     else:
         num_train_positives = np.zeros(test_interactions.shape[0], dtype=np.int32)
 
-    # The second argument is modified in-place, but
-    # here we don't care about the inconsistency
-    # introduced into the ranks matrix.
-    calculate_auc_from_rank(
-        CSRMatrix(ranks), num_train_positives, ranks.data, auc, num_threads
-    )
+    if candidate_items is not None:
+        candidate_items = normalize_candidate_items(
+            candidate_items, test_interactions.shape
+        )
+        effective_candidates = eligible_counts(candidate_items, train_interactions)
+        effective_candidates = effective_candidates.astype(np.int32)
+
+        # The second argument is modified in-place, but
+        # here we don't care about the inconsistency
+        # introduced into the ranks matrix.
+        calculate_auc_from_rank_candidates(
+            CSRMatrix(ranks),
+            effective_candidates,
+            ranks.data,
+            auc,
+            num_threads,
+        )
+    else:
+        # The second argument is modified in-place, but
+        # here we don't care about the inconsistency
+        # introduced into the ranks matrix.
+        calculate_auc_from_rank(
+            CSRMatrix(ranks), num_train_positives, ranks.data, auc, num_threads
+        )
 
     if not preserve_rows:
         auc = auc[test_interactions.getnnz(axis=1) > 0]
@@ -263,6 +339,7 @@ def reciprocal_rank(
     preserve_rows=False,
     num_threads=1,
     check_intersections=True,
+    candidate_items=None,
 ):
     """
     Measure the reciprocal rank metric for a model: 1 / the rank of the highest
@@ -295,6 +372,9 @@ def reciprocal_rank(
         Only relevant when train_interactions are supplied.
         A flag that signals whether the test and train matrices should be checked
         for intersections to prevent optimistic ranks / wrong evaluation / bad data split.
+    candidate_items: scipy sparse boolean matrix of shape [n_users, n_items], optional
+         Per-user candidate eligibility. When supplied, the reciprocal rank is
+         computed from the candidate-restricted ranking.
 
     Returns
     -------
@@ -315,11 +395,12 @@ def reciprocal_rank(
         item_features=item_features,
         num_threads=num_threads,
         check_intersections=check_intersections,
+        candidate_items=candidate_items,
     )
 
     ranks.data = 1.0 / (ranks.data + 1.0)
 
-    ranks = np.squeeze(np.array(ranks.max(axis=1).todense()))
+    ranks = np.asarray(ranks.max(axis=1).todense()).ravel()
 
     if not preserve_rows:
         ranks = ranks[test_interactions.getnnz(axis=1) > 0]
