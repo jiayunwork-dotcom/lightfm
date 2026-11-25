@@ -1,0 +1,20 @@
+Incremental extension benchmark
+============================================================
+batches                                      : 100
+batch_size                                   : 2
+no_components                                : 32
+final_feature_count_per_side                 : 201
+median_extension_ms                          : 0.0594
+mean_extension_ms                            : 0.0600
+max_extension_ms                             : 0.1074
+total_extension_s                            : 0.0060
+param_elements                               : 39798
+hypothetical_dense_user_x_item_elements      : 40401
+dense_to_parameter_ratio                     : 1.0152
+iterator_failure_ms                          : 0.0055
+allocation_failure_ms                        : 0.0693
+rss_start_mb                                 : 83.0664
+rss_checkpoints_mb                           : [(20, 83.06640625), (40, 83.19140625), (60, 83.31640625), (80, 83.44140625), (100, 83.69140625)]
+rss_end_mb                                   : 83.6914
+
+OK: memory stays linear in feature count, no dense U x I table.

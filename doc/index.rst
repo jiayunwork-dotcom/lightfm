@@ -14,6 +14,7 @@ Contents
    Candidate-restricted training and evaluation <candidate_items>
    Cross validation <cross_validation>
    Constructing datasets <lightfm.data>
+   Incremental dataset and model extension <incremental_extension>
    Built-in datasets <datasets>
    Examples <examples>
    FAQ <faq>

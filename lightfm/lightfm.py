@@ -323,6 +323,163 @@ class LightFM(object):
             self.user_embedding_gradients += 1
             self.user_bias_gradients += 1
 
+    def extend_dimensions(self, no_item_features=None, no_user_features=None):
+        """
+        Grow the model's parameter tables to cover additional features.
+
+        Existing feature indices keep their position: every parameter,
+        gradient accumulator and momentum array is extended by appending rows,
+        never by reordering them. New embedding rows use the same random
+        initialisation as :meth:`fit`'s first call; new biases start at zero.
+        AdaGrad accumulators for new rows start at one (with zero momentum),
+        AdaDelta accumulators and momentum start at zero, matching the state a
+        freshly initialised row would have under each schedule.
+
+        The extension is atomic: every replacement array is fully allocated
+        and filled before any model attribute is reassigned, and the random
+        state is rewound on failure, so an allocation error leaves the model
+        exactly as it was. No dense user x item table is ever created; the
+        extra memory is linear in the number of added features.
+
+        Parameters
+        ----------
+
+        no_item_features: int, optional
+            Required total number of item features. Defaults to the current
+            count. Smaller values are rejected.
+        no_user_features: int, optional
+            Required total number of user features. Defaults to the current
+            count. Smaller values are rejected.
+
+        Returns
+        -------
+
+        LightFM
+            The model instance.
+        """
+
+        if self.item_embeddings is None or self.user_embeddings is None:
+            raise ValueError(
+                "You must fit the model before extending its dimensions."
+            )
+
+        no_item_features = (
+            self.item_embeddings.shape[0]
+            if no_item_features is None
+            else int(no_item_features)
+        )
+        no_user_features = (
+            self.user_embeddings.shape[0]
+            if no_user_features is None
+            else int(no_user_features)
+        )
+
+        if no_item_features < self.item_embeddings.shape[0]:
+            raise ValueError(
+                "Cannot shrink item feature space from {} to {} "
+                "features.".format(
+                    self.item_embeddings.shape[0], no_item_features
+                )
+            )
+
+        if no_user_features < self.user_embeddings.shape[0]:
+            raise ValueError(
+                "Cannot shrink user feature space from {} to {} "
+                "features.".format(
+                    self.user_embeddings.shape[0], no_user_features
+                )
+            )
+
+        item_extra = no_item_features - self.item_embeddings.shape[0]
+        user_extra = no_user_features - self.user_embeddings.shape[0]
+
+        # Nothing to do: in particular the random state must not move.
+        if item_extra == 0 and user_extra == 0:
+            return self
+
+        rng_state = self.random_state.get_state()
+
+        def new_embeddings(rows):
+            return (
+                (self.random_state.rand(rows, self.no_components) - 0.5)
+                / self.no_components
+            ).astype(np.float32)
+
+        def new_embedding_state(rows):
+            gradients = np.zeros(
+                (rows, self.no_components), dtype=np.float32
+            )
+            momentum = np.zeros_like(gradients)
+            if self.learning_schedule == "adagrad":
+                gradients += 1
+            return gradients, momentum
+
+        def new_bias_state(rows):
+            gradients = np.zeros(rows, dtype=np.float32)
+            momentum = np.zeros_like(gradients)
+            if self.learning_schedule == "adagrad":
+                gradients += 1
+            return gradients, momentum
+
+        try:
+            replacements = {}
+
+            if item_extra:
+                item_emb_g, item_emb_m = new_embedding_state(item_extra)
+                item_bias_g, item_bias_m = new_bias_state(item_extra)
+                replacements["item_embeddings"] = np.concatenate(
+                    (self.item_embeddings, new_embeddings(item_extra))
+                )
+                replacements["item_embedding_gradients"] = np.concatenate(
+                    (self.item_embedding_gradients, item_emb_g)
+                )
+                replacements["item_embedding_momentum"] = np.concatenate(
+                    (self.item_embedding_momentum, item_emb_m)
+                )
+                replacements["item_biases"] = np.concatenate(
+                    (self.item_biases, np.zeros(item_extra, dtype=np.float32))
+                )
+                replacements["item_bias_gradients"] = np.concatenate(
+                    (self.item_bias_gradients, item_bias_g)
+                )
+                replacements["item_bias_momentum"] = np.concatenate(
+                    (self.item_bias_momentum, item_bias_m)
+                )
+
+            if user_extra:
+                user_emb_g, user_emb_m = new_embedding_state(user_extra)
+                user_bias_g, user_bias_m = new_bias_state(user_extra)
+                replacements["user_embeddings"] = np.concatenate(
+                    (self.user_embeddings, new_embeddings(user_extra))
+                )
+                replacements["user_embedding_gradients"] = np.concatenate(
+                    (self.user_embedding_gradients, user_emb_g)
+                )
+                replacements["user_embedding_momentum"] = np.concatenate(
+                    (self.user_embedding_momentum, user_emb_m)
+                )
+                replacements["user_biases"] = np.concatenate(
+                    (self.user_biases, np.zeros(user_extra, dtype=np.float32))
+                )
+                replacements["user_bias_gradients"] = np.concatenate(
+                    (self.user_bias_gradients, user_bias_g)
+                )
+                replacements["user_bias_momentum"] = np.concatenate(
+                    (self.user_bias_momentum, user_bias_m)
+                )
+        except BaseException:
+            # All allocation failed before any attribute changed; rewind any
+            # random draws so the visible RNG state is preserved too.
+            self.random_state.set_state(rng_state)
+            raise
+
+        # Commit point: plain attribute assignment cannot fail, and the old
+        # arrays stay valid until every replacement is in place.
+        for name, value in replacements.items():
+            setattr(self, name, value)
+
+        return self
+
     def _construct_feature_matrices(
         self, n_users, n_items, user_features, item_features
     ):

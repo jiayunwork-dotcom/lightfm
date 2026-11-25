@@ -4,6 +4,19 @@
 
 ### Added
 
+- `Dataset.fit_partial` now accepts an optional fitted `LightFM` model. When
+  supplied, appending new user/item ids or features grows the dataset's four
+  mappings and the model's embeddings, biases and optimiser state in one
+  atomic operation: existing indices never move, learned parameters are
+  preserved element by element, and scores computed from the pre-extension
+  feature rows stay bitwise identical. New rows receive the AdaGrad (gradient
+  accumulator initialised to one) or AdaDelta (zero accumulators) starting
+  state appropriate to the learning schedule. Calls that add only known
+  entries are no-ops that do not move the random state, and any iterator,
+  validation or allocation failure rolls the mappings, model parameters,
+  optimiser state and random state back to their pre-call values. The same
+  capacity extension is available directly as
+  `LightFM.extend_dimensions`.
 - Added an optional `candidate_items` sparse boolean matrix to `LightFM.fit`,
   `LightFM.fit_partial`, `LightFM.predict_rank`, `precision_at_k`,
   `recall_at_k`, `auc_score` and `reciprocal_rank`. It restricts training

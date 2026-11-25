@@ -6,6 +6,8 @@ import scipy.sparse as sp
 
 import sklearn.preprocessing
 
+from .lightfm import LightFM
+
 
 class _IncrementalCOOMatrix(object):
     def __init__(self, shape, dtype):
@@ -148,8 +150,11 @@ class Dataset(object):
       item id, weight) to build an interactions and weights matrix.
     - Call `build_user/item_features` with iterables of (user/item id, [features])
       or (user/item id, {feature: feature weight}) to build feature matrices.
-    - To add new user/item ids or features, call `fit_partial` again. You will need
-      to resize your LightFM model to be able to use the new features.
+    - To add new user/item ids or features, call `fit_partial` again. Pass
+      the fitted LightFM model as its `model` argument to grow the model's
+      embeddings, biases and optimiser state in the same, atomic operation;
+      without it you will need to resize the model yourself before it can use
+      the new features.
 
     Parameters
     ----------
@@ -210,12 +215,28 @@ class Dataset(object):
         return self.fit_partial(users, items, user_features, item_features)
 
     def fit_partial(
-        self, users=None, items=None, user_features=None, item_features=None
+        self,
+        users=None,
+        items=None,
+        user_features=None,
+        item_features=None,
+        model=None,
     ):
         """
         Fit the user/item id and feature name mappings.
 
         Calling fit the second time will add new entries to existing mappings.
+
+        When a fitted :class:`lightfm.LightFM` model is supplied as ``model``,
+        the mappings and the model's parameter arrays are extended together as
+        a single atomic change. New ids and features get fresh internal
+        indices appended after the existing ones, so previously assigned
+        indices never move. Existing embeddings, biases and optimiser state
+        (AdaGrad gradient accumulators and AdaDelta accumulators/momentum) are
+        preserved element by element, and scores recomputed with the
+        pre-extension feature rows are unchanged. The model's random state is
+        only advanced when new parameters have to be initialised; a call that
+        adds nothing is a no-op.
 
         Parameters
         ----------
@@ -224,37 +245,171 @@ class Dataset(object):
         items: iterable of item ids, optional
         user_features: iterable of user features, optional
         item_features: iterable of item features, optional
+        model: LightFM, optional
+            A model already fitted against this dataset's previous feature
+            space. If supplied, the user and item feature counts of the
+            fitted model must not be smaller than the dataset's current
+            feature counts, otherwise a ``ValueError`` is raised before any
+            state is touched. On success the model is grown to hold an
+            embedding, a bias and the matching optimiser state for every
+            feature in the extended mappings. When omitted, only the mappings
+            are updated, exactly as in previous versions.
+
+        Returns
+        -------
+
+        Dataset
+            The dataset instance.
+
+        Raises
+        ------
+
+        ValueError
+            If ``model`` is supplied but its user/item feature dimensionality
+            is smaller than the dataset's current dimensionality, or if the
+            input iterables cannot be consumed. On any failure the four
+            mappings, the model parameters, the optimiser state and the
+            random state are left exactly as they were before the call.
         """
+
+        if model is not None and not isinstance(model, LightFM):
+            raise TypeError(
+                "model must be a fitted LightFM instance or None, "
+                "got {}.".format(type(model).__name__)
+            )
+
+        # Phase 1: stage every would-be addition without touching the live
+        # mappings. An exception while consuming an input iterable therefore
+        # leaves the dataset (and, if supplied, the model) untouched.
+        staged = {
+            "user_id": [],
+            "item_id": [],
+            "user_feature": [],
+            "item_feature": [],
+        }
+
+        def stage(mapping, staged_keys, key):
+            if key not in mapping and key not in staged_keys:
+                staged_keys.append(key)
 
         if users is not None:
             for user_id in users:
-                self._user_id_mapping.setdefault(user_id, len(self._user_id_mapping))
+                stage(self._user_id_mapping, staged["user_id"], user_id)
 
                 if self._user_identity_features:
-                    self._user_feature_mapping.setdefault(
-                        user_id, len(self._user_feature_mapping)
+                    stage(
+                        self._user_feature_mapping,
+                        staged["user_feature"],
+                        user_id,
                     )
 
         if items is not None:
             for item_id in items:
-                self._item_id_mapping.setdefault(item_id, len(self._item_id_mapping))
+                stage(self._item_id_mapping, staged["item_id"], item_id)
 
                 if self._item_identity_features:
-                    self._item_feature_mapping.setdefault(
-                        item_id, len(self._item_feature_mapping)
+                    stage(
+                        self._item_feature_mapping,
+                        staged["item_feature"],
+                        item_id,
                     )
 
         if user_features is not None:
             for user_feature in user_features:
-                self._user_feature_mapping.setdefault(
-                    user_feature, len(self._user_feature_mapping)
+                stage(
+                    self._user_feature_mapping,
+                    staged["user_feature"],
+                    user_feature,
                 )
 
         if item_features is not None:
             for item_feature in item_features:
-                self._item_feature_mapping.setdefault(
-                    item_feature, len(self._item_feature_mapping)
+                stage(
+                    self._item_feature_mapping,
+                    staged["item_feature"],
+                    item_feature,
                 )
+
+        # Everything is already known: no mapping, parameter or random state
+        # change.
+        if not any(staged.values()):
+            return self
+
+        if model is not None:
+            self._check_model_compatible(model)
+
+        # Phase 2: commit. Appending only reassigns indices that the staging
+        # phase proved to be new, so existing indices never move.
+        for user_id in staged["user_id"]:
+            self._user_id_mapping.setdefault(
+                user_id, len(self._user_id_mapping)
+            )
+        for item_id in staged["item_id"]:
+            self._item_id_mapping.setdefault(
+                item_id, len(self._item_id_mapping)
+            )
+        for user_feature in staged["user_feature"]:
+            self._user_feature_mapping.setdefault(
+                user_feature, len(self._user_feature_mapping)
+            )
+        for item_feature in staged["item_feature"]:
+            self._item_feature_mapping.setdefault(
+                item_feature, len(self._item_feature_mapping)
+            )
+
+        if model is None:
+            return self
+
+        no_user_features, no_item_features = self.model_dimensions()
+
+        try:
+            model.extend_dimensions(
+                no_item_features=no_item_features,
+                no_user_features=no_user_features,
+            )
+        except BaseException:
+            # Roll back precisely the keys added during phase 2; indices of
+            # pre-existing entries are unaffected.
+            for user_id in staged["user_id"]:
+                self._user_id_mapping.pop(user_id, None)
+            for item_id in staged["item_id"]:
+                self._item_id_mapping.pop(item_id, None)
+            for user_feature in staged["user_feature"]:
+                self._user_feature_mapping.pop(user_feature, None)
+            for item_feature in staged["item_feature"]:
+                self._item_feature_mapping.pop(item_feature, None)
+            raise
+
+        return self
+
+    def _check_model_compatible(self, model):
+        """Validate that ``model`` can be grown to cover the current mappings."""
+
+        if model.item_embeddings is None or model.user_embeddings is None:
+            raise ValueError(
+                "The supplied LightFM model has not been fitted yet; fit it "
+                "on the current feature space before extending it."
+            )
+
+        no_user_features, no_item_features = self.model_dimensions()
+
+        if model.user_embeddings.shape[0] < no_user_features:
+            raise ValueError(
+                "Model user feature dimensionality ({}) is smaller than the "
+                "dataset's current user feature count ({}). Extend the same "
+                "model instance that was fitted on this dataset.".format(
+                    model.user_embeddings.shape[0], no_user_features
+                )
+            )
+
+        if model.item_embeddings.shape[0] < no_item_features:
+            raise ValueError(
+                "Model item feature dimensionality ({}) is smaller than the "
+                "dataset's current item feature count ({}). Extend the same "
+                "model instance that was fitted on this dataset.".format(
+                    model.item_embeddings.shape[0], no_item_features
+                )
+            )
 
     def _unpack_datum(self, datum):
 
